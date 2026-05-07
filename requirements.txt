@@ -1,0 +1,6 @@
+aiortc>=1.14.0
+aiohttp>=3.9.0
+mss>=10.0.0
+numpy>=1.24.0
+av>=16.0.0
+soundcard>=0.4.3

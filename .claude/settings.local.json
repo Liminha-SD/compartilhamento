@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Bash(pip3 show *)",
+      "Bash(pip3 index *)",
+      "Bash(python3 -m venv venv)",
+      "Bash(venv/bin/pip install *)"
+    ]
+  }
+}
