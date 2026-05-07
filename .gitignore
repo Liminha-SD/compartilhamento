@@ -1,0 +1,52 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Pip / build
+build/
+dist/
+*.egg-info/
+
+# PyInstaller
+*.spec
+
+# Logs
+*.log
+
+# === VS Code ===
+.vscode/
+
+# === PyCharm / JetBrains ===
+.idea/
+
+# === Windows ===
+Thumbs.db
+Desktop.ini
+
+# === Mac ===
+.DS_Store
+
+# === Jupyter ===
+.ipynb_checkpoints
+
+# === Qt / PySide ===
+*.ui.autosave
+*.qrc.autosave
+
+# === Cache geral ===
+.cache/
+
+# Arquivos temporários
+*.tmp
+*.bak
+
+# Arquivos de configuração locais
+.env
