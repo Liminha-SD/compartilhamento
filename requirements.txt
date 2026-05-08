@@ -3,5 +3,5 @@ aiohttp>=3.9.0
 mss>=10.0.0
 numpy>=1.24.0
 av>=16.0.0
-sounddevice>=0.4.6
+pyaudiowpatch>=0.2.12.5  # WASAPI loopback no Windows
 pywin32>=306        # Windows only — cursor capture

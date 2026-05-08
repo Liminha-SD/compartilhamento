@@ -153,45 +153,44 @@ class ScreenVideoTrack(VideoStreamTrack):
 
 
 try:
-    import sounddevice as sd
+    import pyaudiowpatch as pyaudio
 
-    def _find_output_device(hint: int = -1) -> tuple[int, int, str]:
+    def _find_wasapi_loopback(hint: int = -1):
         """
-        Retorna (device_idx, channels, name) para loopback WASAPI.
-        hint >= 0 força um dispositivo específico (via --audio-device).
+        Retorna (device_info, pa_instance) para loopback WASAPI.
+        hint >= 0 força um índice específico (via --audio-device).
         """
-        devices = sd.query_devices()
+        pa = pyaudio.PyAudio()
 
         if hint >= 0:
-            d = devices[hint]
-            ch = min(max(d["max_output_channels"], 1), 2)
-            return hint, ch, d["name"]
+            d = pa.get_device_info_by_index(hint)
+            return d, pa
 
-        # Saída padrão do sistema
+        # Dispositivo de saída padrão WASAPI
         try:
-            idx = sd.default.device[1]
-            d   = devices[idx]
-            if d["max_output_channels"] > 0:
-                ch = min(d["max_output_channels"], 2)
-                return idx, ch, d["name"]
-        except Exception:
-            pass
+            wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
 
-        # Fallback: primeiro dispositivo de saída disponível
-        for i, d in enumerate(devices):
-            if d["max_output_channels"] > 0:
-                return i, min(d["max_output_channels"], 2), d["name"]
+            # Procura a versão loopback do dispositivo padrão
+            for lb in pa.get_loopback_device_info_generator():
+                if default["name"] in lb["name"]:
+                    log.info(f"Áudio WASAPI loopback: {lb['name']}")
+                    return lb, pa
 
-        raise RuntimeError(
-            "Nenhum dispositivo de saída encontrado.\n"
-            "  Use --list-audio para ver os dispositivos disponíveis."
-        )
+            # Se não encontrou versão loopback por nome, usa o padrão direto
+            log.info(f"Áudio WASAPI loopback (direto): {default['name']}")
+            return default, pa
+
+        except Exception as e:
+            raise RuntimeError(
+                f"WASAPI loopback não encontrado: {e}\n"
+                "  Use --list-audio para ver dispositivos disponíveis."
+            )
 
     class SystemAudioTrack(AudioStreamTrack):
-        """Captura todo o áudio do sistema via WASAPI loopback (sounddevice)."""
+        """Captura todo o áudio do sistema via WASAPI loopback (pyaudiowpatch)."""
 
-        SAMPLE_RATE = 48000
-        CHUNK       = 960   # 20 ms @ 48 kHz
+        CHUNK = 960   # 20 ms @ 48 kHz
 
         def __init__(self, device: int = -1):
             super().__init__()
@@ -201,32 +200,47 @@ try:
             threading.Thread(target=self._capture, daemon=True).start()
 
         def _capture(self):
+            pa = None
+            stream = None
             try:
-                idx, channels, name = _find_output_device(self._device)
-                log.info(f"Áudio WASAPI loopback: [{idx}] {name} ({channels}ch)")
-                with sd.InputStream(
-                    device=idx,
+                dev, pa = _find_wasapi_loopback(self._device)
+                rate     = int(dev["defaultSampleRate"])
+                channels = min(int(dev["maxInputChannels"]), 2)
+
+                stream = pa.open(
+                    format=pyaudio.paFloat32,
                     channels=channels,
-                    samplerate=self.SAMPLE_RATE,
-                    blocksize=self.CHUNK,
-                    dtype="float32",
-                    extra_settings=sd.WasapiSettings(loopback=True),
-                ) as stream:
-                    while True:
-                        data, _ = stream.read(self.CHUNK)
-                        # Garante sempre 2 canais
-                        if data.shape[1] == 1:
-                            data = np.repeat(data, 2, axis=1)
-                        fut = asyncio.run_coroutine_threadsafe(
-                            self._queue.put(data[:, :2]), self._loop
-                        )
-                        try:
-                            fut.result(timeout=0.05)
-                        except Exception:
-                            pass
+                    rate=rate,
+                    frames_per_buffer=self.CHUNK,
+                    input=True,
+                    input_device_index=dev["index"],
+                )
+
+                log.info(f"Áudio capturando: {dev['name']} @ {rate}Hz {channels}ch")
+
+                while True:
+                    raw  = stream.read(self.CHUNK, exception_on_overflow=False)
+                    data = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+                    if channels == 1:
+                        data = np.repeat(data, 2, axis=1)
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._queue.put(data[:, :2]), self._loop
+                    )
+                    try:
+                        fut.result(timeout=0.05)
+                    except Exception:
+                        pass
+
             except Exception as exc:
                 log.error(f"Captura de áudio falhou: {exc}")
                 log.error("  Use --list-audio para ver dispositivos disponíveis")
+            finally:
+                if stream:
+                    try: stream.stop_stream(); stream.close()
+                    except Exception: pass
+                if pa:
+                    try: pa.terminate()
+                    except Exception: pass
 
         async def recv(self) -> av.AudioFrame:
             pts, time_base = await self.next_timestamp()
@@ -235,18 +249,19 @@ try:
             except asyncio.TimeoutError:
                 data = np.zeros((self.CHUNK, 2), dtype=np.float32)
 
-            pcm = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+            rate = 48000
+            pcm  = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
             frame = av.AudioFrame.from_ndarray(pcm.T, format="s16", layout="stereo")
             frame.pts         = pts
             frame.time_base   = time_base
-            frame.sample_rate = self.SAMPLE_RATE
+            frame.sample_rate = rate
             return frame
 
     AUDIO_OK = True
 
 except ImportError:
     AUDIO_OK = False
-    log.warning("sounddevice não instalado — áudio desativado")
+    log.warning("pyaudiowpatch não instalado — áudio desativado")
 
 
 # ─── HTML embutido ────────────────────────────────────────────────────────────
@@ -445,8 +460,9 @@ async def on_startup(app: web.Application) -> None:
 
     if AUDIO_OK:
         try:
-            idx, ch, name = _find_output_device(_args.audio_device)
-            log.info(f"Áudio confirmado: [{idx}] {name} ({ch}ch)")
+            dev, pa = _find_wasapi_loopback(_args.audio_device)
+            pa.terminate()
+            log.info(f"Áudio confirmado: [{dev['index']}] {dev['name']}")
         except Exception as e:
             log.warning(f"Áudio: {e}")
 
@@ -460,25 +476,30 @@ async def on_shutdown(app: web.Application) -> None:
 
 def list_audio():
     if not AUDIO_OK:
-        print("sounddevice não instalado.")
+        print("pyaudiowpatch não instalado.")
         return
-    devices = sd.query_devices()
-    default_in, default_out = sd.default.device
-    print(f"\n{'Idx':>4}  {'Saída':>5}  {'Entrada':>7}  Nome")
-    print("─" * 55)
-    for i, d in enumerate(devices):
-        out = d["max_output_channels"]
-        inp = d["max_input_channels"]
-        if out == 0 and inp == 0:
-            continue
-        marks = []
-        if i == default_out: marks.append("← saída padrão")
-        if i == default_in:  marks.append("← entrada padrão")
-        note = "  " + ", ".join(marks) if marks else ""
-        print(f"{i:>4}  {out:>5}  {inp:>7}  {d['name']}{note}")
-    print()
-    print("Para usar um dispositivo específico: --audio-device <Idx>")
-    print()
+    pa = pyaudio.PyAudio()
+    try:
+        wasapi     = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_out = wasapi["defaultOutputDevice"]
+        default_in  = wasapi["defaultInputDevice"]
+
+        print(f"\n{'Idx':>4}  {'Ch Out':>6}  {'Ch In':>5}  {'Loopback':>8}  Nome")
+        print("─" * 65)
+        for i in range(pa.get_device_count()):
+            d  = pa.get_device_info_by_index(i)
+            lb = "sim" if d.get("isLoopbackDevice") else "não"
+            marks = []
+            if i == default_out: marks.append("← saída padrão")
+            if i == default_in:  marks.append("← entrada padrão")
+            note = "  " + ", ".join(marks) if marks else ""
+            print(f"{i:>4}  {int(d['maxOutputChannels']):>6}  {int(d['maxInputChannels']):>5}"
+                  f"  {lb:>8}  {d['name']}{note}")
+        print()
+        print("Loopback=sim são os dispositivos que capturam áudio do sistema.")
+        print("Use --audio-device <Idx> para selecionar um específico.\n")
+    finally:
+        pa.terminate()
 
 
 def list_monitors():
