@@ -27,6 +27,7 @@ import argparse
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+import fractions
 import json
 import logging
 import threading
@@ -106,7 +107,7 @@ class ScreenVideoTrack(VideoStreamTrack):
 
     def _capture_loop(self) -> None:
         """Roda em thread própria, capturando continuamente sem depender do event loop."""
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             mon      = sct.monitors[self._monitor]
             left     = mon["left"]
             top      = mon["top"]
@@ -194,7 +195,9 @@ try:
 
         def __init__(self, device: int = -1):
             super().__init__()
-            self._device = device
+            self._device    = device
+            self._pts       = 0
+            self._time_base = fractions.Fraction(1, self.SAMPLE_RATE)
             self._queue: asyncio.Queue = asyncio.Queue(maxsize=8)
             self._loop = asyncio.get_event_loop()
             threading.Thread(target=self._capture, daemon=True).start()
@@ -243,18 +246,17 @@ try:
                     except Exception: pass
 
         async def recv(self) -> av.AudioFrame:
-            pts, time_base = await self.next_timestamp()
             try:
                 data = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 data = np.zeros((self.CHUNK, 2), dtype=np.float32)
 
-            rate = 48000
-            pcm  = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+            pcm   = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
             frame = av.AudioFrame.from_ndarray(pcm.T, format="s16", layout="stereo")
-            frame.pts         = pts
-            frame.time_base   = time_base
-            frame.sample_rate = rate
+            frame.pts         = self._pts
+            frame.time_base   = self._time_base
+            frame.sample_rate = self.SAMPLE_RATE
+            self._pts        += self.CHUNK   # avança 960 samples = 20 ms
             return frame
 
     AUDIO_OK = True
@@ -451,7 +453,7 @@ async def handle_offer(request: web.Request) -> web.Response:
 async def on_startup(app: web.Application) -> None:
     """Pré-aquece captura e áudio para que o primeiro cliente conecte instantaneamente."""
     try:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             idx = min(_args.monitor, len(sct.monitors) - 1)
             sct.grab(sct.monitors[idx])
         log.info("Captura de tela aquecida")
@@ -503,7 +505,7 @@ def list_audio():
 
 
 def list_monitors():
-    with mss.mss() as sct:
+    with mss.MSS() as sct:
         print(f"\n{'Idx':>4}  {'Resolução':>16}  {'Posição'}")
         print("-" * 40)
         for i, m in enumerate(sct.monitors):
