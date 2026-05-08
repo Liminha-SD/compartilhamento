@@ -16,9 +16,12 @@ No OBS:
 Monitores disponíveis: use --list-monitors para ver os índices.
 """
 
+import sys
+
+print("Carregando módulos...", flush=True)
+
 import asyncio
 import argparse
-import sys
 
 # Windows: força SelectorEventLoop (necessário para aiortc/aiohttp funcionarem corretamente)
 if sys.platform == "win32":
@@ -227,28 +230,63 @@ HTML = """<!DOCTYPE html>
     const statusEl = document.getElementById('status');
     const videoEl  = document.getElementById('v');
 
-    async function connect() {
-      statusEl.textContent = 'Conectando…';
-      statusEl.style.display = '';
+    let pc             = null;
+    let reconnectTimer = null;
+    let isConnecting   = false;
 
-      const pc     = new RTCPeerConnection({ iceServers: [] });
+    function status(msg, color) {
+      statusEl.textContent = msg;
+      statusEl.style.color = color || '#0f0';
+      statusEl.style.display = '';
+    }
+
+    function scheduleReconnect(ms) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        isConnecting = false;
+        connect().catch(err => {
+          status('Erro: ' + err.message, '#f44');
+          scheduleReconnect(3000);
+        });
+      }, ms);
+    }
+
+    async function connect() {
+      if (isConnecting) return;
+      isConnecting = true;
+      clearTimeout(reconnectTimer);
+      status('Conectando…', '#ff0');
+
+      if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
       const stream = new MediaStream();
       videoEl.srcObject = stream;
 
       pc.ontrack = e => {
         stream.addTrack(e.track);
         if (e.track.kind === 'video') {
-          statusEl.textContent = '● Live';
+          status('● Live', '#0f0');
           setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
         }
       };
 
       pc.onconnectionstatechange = () => {
-        if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
-          statusEl.textContent = '⚠ ' + pc.connectionState + ' — reconectando…';
-          statusEl.style.display = '';
-          pc.close();
-          setTimeout(connect, 2000);
+        const s = pc.connectionState;
+        if (s === 'connected') {
+          clearTimeout(reconnectTimer);
+          isConnecting = false;
+        } else if (s === 'failed') {
+          // Falhou de vez — reconecta em 1.5s
+          status('⚠ falhou — reconectando…', '#f44');
+          scheduleReconnect(1500);
+        } else if (s === 'disconnected') {
+          // Transitório — aguarda 8s antes de reconectar (costuma se recuperar sozinho)
+          status('⚠ desconectado — aguardando…', '#fa0');
+          scheduleReconnect(8000);
         }
       };
 
@@ -258,13 +296,13 @@ HTML = """<!DOCTYPE html>
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Aguarda coleta de ICE candidates (máx 2s)
+      // Aguarda ICE candidates (máx 5s — necessário para Tailscale)
       await new Promise(r => {
         if (pc.iceGatheringState === 'complete') return r();
         pc.addEventListener('icegatheringstatechange', () => {
           if (pc.iceGatheringState === 'complete') r();
         });
-        setTimeout(r, 2000);
+        setTimeout(r, 5000);
       });
 
       const res = await fetch('/offer', {
@@ -273,14 +311,15 @@ HTML = """<!DOCTYPE html>
         body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
       });
 
-      if (!res.ok) throw new Error('Servidor retornou ' + res.status);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const ans = await res.json();
       await pc.setRemoteDescription(ans);
+      isConnecting = false;
     }
 
-    connect().catch(e => {
-      statusEl.textContent = 'Erro: ' + e.message;
-      setTimeout(connect, 3000);
+    connect().catch(err => {
+      status('Erro: ' + err.message, '#f44');
+      scheduleReconnect(3000);
     });
   })();
   </script>
@@ -347,6 +386,24 @@ async def handle_offer(request: web.Request) -> web.Response:
     )
 
 
+async def on_startup(app: web.Application) -> None:
+    """Pré-aquece captura e áudio para que o primeiro cliente conecte instantaneamente."""
+    try:
+        with mss.mss() as sct:
+            idx = min(_args.monitor, len(sct.monitors) - 1)
+            sct.grab(sct.monitors[idx])
+        log.info("Captura de tela aquecida")
+    except Exception as e:
+        log.debug(f"Warmup de tela falhou: {e}")
+
+    if AUDIO_OK:
+        try:
+            _find_loopback_mic()
+            log.info("Dispositivo de áudio confirmado")
+        except Exception as e:
+            log.warning(f"Áudio: {e}")
+
+
 async def on_shutdown(app: web.Application) -> None:
     await asyncio.gather(*[pc.close() for pc in pcs])
     pcs.clear()
@@ -407,6 +464,7 @@ def main():
         return
 
     app = web.Application()
+    app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     app.router.add_get("/", handle_index)
     app.router.add_post("/offer", handle_offer)
