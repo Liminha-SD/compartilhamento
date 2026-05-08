@@ -30,6 +30,7 @@ if sys.platform == "win32":
 import json
 import logging
 import threading
+import time
 
 import av
 import mss
@@ -89,31 +90,66 @@ def _grab_win32_cursor(left: int, top: int, width: int, height: int) -> np.ndarr
 # ─── Tracks ──────────────────────────────────────────────────────────────────
 
 class ScreenVideoTrack(VideoStreamTrack):
-    """Captura a tela (com cursor no Windows) e serve como track de vídeo WebRTC."""
+    """
+    Captura contínua em thread dedicada — o frame mais recente está sempre pronto.
+    recv() nunca bloqueia esperando a captura, eliminando jitter.
+    """
 
-    def __init__(self, monitor: int = 1, fps: int = 30):
+    def __init__(self, monitor: int = 1, fps: int = 60, scale_width: int = 0):
         super().__init__()
-        self._monitor = monitor
-        self._fps = fps
-        self._sct = None
+        self._monitor    = monitor
+        self._fps        = fps
+        self._scale_w    = scale_width
+        self._latest: np.ndarray | None = None
+        self._lock       = threading.Lock()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+
+    def _capture_loop(self) -> None:
+        """Roda em thread própria, capturando continuamente sem depender do event loop."""
+        with mss.mss() as sct:
+            mon      = sct.monitors[self._monitor]
+            left     = mon["left"]
+            top      = mon["top"]
+            w, h     = mon["width"], mon["height"]
+            interval = 1.0 / (self._fps + 10)   # captura um pouco mais rápido que o FPS alvo
+
+            while True:
+                t0 = time.monotonic()
+
+                if WIN32_OK:
+                    img = _grab_win32_cursor(left, top, w, h)
+                else:
+                    raw = sct.grab(mon)
+                    img = np.frombuffer(raw.raw, dtype=np.uint8).reshape(h, w, 4)
+
+                with self._lock:
+                    self._latest = img
+
+                sleep = interval - (time.monotonic() - t0)
+                if sleep > 0:
+                    time.sleep(sleep)
 
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
-        loop = asyncio.get_event_loop()
-        img = await loop.run_in_executor(None, self._grab)
+
+        with self._lock:
+            img = self._latest
+
+        if img is None:
+            # Thread de captura ainda iniciando (raro)
+            await asyncio.sleep(0.02)
+            with self._lock:
+                img = self._latest
+
         frame = av.VideoFrame.from_ndarray(img, format="bgra")
-        frame.pts = pts
+
+        if self._scale_w and frame.width != self._scale_w:
+            scale_h = int(frame.height * self._scale_w / frame.width) & ~1
+            frame   = frame.reformat(width=self._scale_w, height=scale_h)
+
+        frame.pts       = pts
         frame.time_base = time_base
         return frame
-
-    def _grab(self) -> np.ndarray:
-        if self._sct is None:
-            self._sct = mss.mss()
-        mon = self._sct.monitors[self._monitor]
-        if WIN32_OK:
-            return _grab_win32_cursor(mon["left"], mon["top"], mon["width"], mon["height"])
-        raw = self._sct.grab(mon)
-        return np.frombuffer(raw.raw, dtype=np.uint8).reshape(raw.height, raw.width, 4)
 
 
 try:
@@ -368,8 +404,9 @@ async def handle_offer(request: web.Request) -> web.Response:
     monitor  = int(request.rel_url.query.get("monitor", _args.monitor))
     fps      = int(request.rel_url.query.get("fps",     _args.fps))
     bitrate  = int(request.rel_url.query.get("bitrate", _args.bitrate))
+    scale    = int(request.rel_url.query.get("scale",   _args.scale))
 
-    pc.addTrack(ScreenVideoTrack(monitor=monitor, fps=fps))
+    pc.addTrack(ScreenVideoTrack(monitor=monitor, fps=fps, scale_width=scale))
     if AUDIO_OK:
         pc.addTrack(SystemAudioTrack())
 
@@ -451,6 +488,7 @@ def main():
     parser.add_argument("--monitor",       type=int, default=1,    help="Índice do monitor (padrão: 1)")
     parser.add_argument("--fps",           type=int, default=60,    help="FPS alvo (padrão: 60)")
     parser.add_argument("--bitrate",       type=int, default=8000,  help="Bitrate de vídeo em kbps (padrão: 8000)")
+    parser.add_argument("--scale",         type=int, default=0,     help="Largura de encoding em px, 0=nativo (ex: 1280 para 720p)")
     parser.add_argument("--list-monitors", action="store_true", help="Lista monitores disponíveis e sai")
     parser.add_argument("--list-audio",   action="store_true", help="Lista dispositivos de áudio e sai")
     _args = parser.parse_args()
@@ -470,7 +508,8 @@ def main():
     app.router.add_post("/offer", handle_offer)
 
     log.info("─" * 55)
-    log.info(f"  Monitor  : {_args.monitor}   FPS: {_args.fps}   Bitrate: {_args.bitrate} kbps")
+    scale_info = f"{_args.scale}px largura" if _args.scale else "nativo"
+    log.info(f"  Monitor  : {_args.monitor}   FPS: {_args.fps}   Bitrate: {_args.bitrate} kbps   Scale: {scale_info}")
     log.info(f"  Áudio    : {'loopback (soundcard)' if AUDIO_OK else 'desativado'}")
     log.info(f"  Endereço : http://0.0.0.0:{_args.port}")
     log.info("")
