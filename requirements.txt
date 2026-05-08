@@ -3,5 +3,5 @@ aiohttp>=3.9.0
 mss>=10.0.0
 numpy>=1.24.0
 av>=16.0.0
-soundcard>=0.4.3
+sounddevice>=0.4.6
 pywin32>=306        # Windows only — cursor capture

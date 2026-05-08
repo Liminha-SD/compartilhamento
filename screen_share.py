@@ -153,64 +153,72 @@ class ScreenVideoTrack(VideoStreamTrack):
 
 
 try:
-    import soundcard as sc
+    import sounddevice as sd
 
-    def _find_loopback_mic():
-        """Procura dispositivo de loopback para captura do áudio do sistema."""
-        # 1. Loopback do speaker padrão (nome exato)
-        try:
-            spk = sc.default_speaker()
-            mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
-            log.info(f"Áudio: loopback de '{spk.name}'")
-            return mic
-        except Exception as e:
-            log.debug(f"Loopback pelo nome falhou: {e}")
+    def _find_output_device(hint: int = -1) -> tuple[int, int, str]:
+        """
+        Retorna (device_idx, channels, name) para loopback WASAPI.
+        hint >= 0 força um dispositivo específico (via --audio-device).
+        """
+        devices = sd.query_devices()
 
-        # 2. Qualquer mic marcado como loopback
-        try:
-            loopbacks = [m for m in sc.all_microphones(include_loopback=True)
-                         if getattr(m, "isloopback", False)]
-            if loopbacks:
-                log.info(f"Áudio: loopback automático '{loopbacks[0].name}'")
-                return loopbacks[0]
-        except Exception as e:
-            log.debug(f"Busca por loopbacks falhou: {e}")
+        if hint >= 0:
+            d = devices[hint]
+            ch = min(max(d["max_output_channels"], 1), 2)
+            return hint, ch, d["name"]
 
-        # 3. Stereo Mix (Windows legado)
+        # Saída padrão do sistema
         try:
-            mic = sc.get_microphone("Stereo Mix")
-            log.info("Áudio: usando Stereo Mix")
-            return mic
+            idx = sd.default.device[1]
+            d   = devices[idx]
+            if d["max_output_channels"] > 0:
+                ch = min(d["max_output_channels"], 2)
+                return idx, ch, d["name"]
         except Exception:
             pass
 
+        # Fallback: primeiro dispositivo de saída disponível
+        for i, d in enumerate(devices):
+            if d["max_output_channels"] > 0:
+                return i, min(d["max_output_channels"], 2), d["name"]
+
         raise RuntimeError(
-            "Nenhum dispositivo de loopback encontrado.\n"
-            "  Use --list-audio para ver os dispositivos disponíveis.\n"
-            "  No Windows: Painel de Som > Gravação > clique direito > "
-            "Mostrar dispositivos desativados > ativar 'Stereo Mix'"
+            "Nenhum dispositivo de saída encontrado.\n"
+            "  Use --list-audio para ver os dispositivos disponíveis."
         )
 
     class SystemAudioTrack(AudioStreamTrack):
-        """Captura o áudio do sistema (loopback) via soundcard."""
+        """Captura todo o áudio do sistema via WASAPI loopback (sounddevice)."""
 
         SAMPLE_RATE = 48000
-        CHUNK = 960  # 20 ms @ 48 kHz
+        CHUNK       = 960   # 20 ms @ 48 kHz
 
-        def __init__(self):
+        def __init__(self, device: int = -1):
             super().__init__()
+            self._device = device
             self._queue: asyncio.Queue = asyncio.Queue(maxsize=8)
             self._loop = asyncio.get_event_loop()
             threading.Thread(target=self._capture, daemon=True).start()
 
         def _capture(self):
             try:
-                mic = _find_loopback_mic()
-                with mic.recorder(samplerate=self.SAMPLE_RATE, channels=2) as rec:
+                idx, channels, name = _find_output_device(self._device)
+                log.info(f"Áudio WASAPI loopback: [{idx}] {name} ({channels}ch)")
+                with sd.InputStream(
+                    device=idx,
+                    channels=channels,
+                    samplerate=self.SAMPLE_RATE,
+                    blocksize=self.CHUNK,
+                    dtype="float32",
+                    extra_settings=sd.WasapiSettings(loopback=True),
+                ) as stream:
                     while True:
-                        data = rec.record(numframes=self.CHUNK)
+                        data, _ = stream.read(self.CHUNK)
+                        # Garante sempre 2 canais
+                        if data.shape[1] == 1:
+                            data = np.repeat(data, 2, axis=1)
                         fut = asyncio.run_coroutine_threadsafe(
-                            self._queue.put(data), self._loop
+                            self._queue.put(data[:, :2]), self._loop
                         )
                         try:
                             fut.result(timeout=0.05)
@@ -218,6 +226,7 @@ try:
                             pass
             except Exception as exc:
                 log.error(f"Captura de áudio falhou: {exc}")
+                log.error("  Use --list-audio para ver dispositivos disponíveis")
 
         async def recv(self) -> av.AudioFrame:
             pts, time_base = await self.next_timestamp()
@@ -228,8 +237,8 @@ try:
 
             pcm = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
             frame = av.AudioFrame.from_ndarray(pcm.T, format="s16", layout="stereo")
-            frame.pts = pts
-            frame.time_base = time_base
+            frame.pts         = pts
+            frame.time_base   = time_base
             frame.sample_rate = self.SAMPLE_RATE
             return frame
 
@@ -237,7 +246,7 @@ try:
 
 except ImportError:
     AUDIO_OK = False
-    log.warning("soundcard não instalado — áudio desativado")
+    log.warning("sounddevice não instalado — áudio desativado")
 
 
 # ─── HTML embutido ────────────────────────────────────────────────────────────
@@ -408,7 +417,8 @@ async def handle_offer(request: web.Request) -> web.Response:
 
     pc.addTrack(ScreenVideoTrack(monitor=monitor, fps=fps, scale_width=scale))
     if AUDIO_OK:
-        pc.addTrack(SystemAudioTrack())
+        audio_dev = int(request.rel_url.query.get("audio_device", _args.audio_device))
+        pc.addTrack(SystemAudioTrack(device=audio_dev))
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
@@ -435,8 +445,8 @@ async def on_startup(app: web.Application) -> None:
 
     if AUDIO_OK:
         try:
-            _find_loopback_mic()
-            log.info("Dispositivo de áudio confirmado")
+            idx, ch, name = _find_output_device(_args.audio_device)
+            log.info(f"Áudio confirmado: [{idx}] {name} ({ch}ch)")
         except Exception as e:
             log.warning(f"Áudio: {e}")
 
@@ -450,17 +460,24 @@ async def on_shutdown(app: web.Application) -> None:
 
 def list_audio():
     if not AUDIO_OK:
-        print("soundcard não instalado.")
+        print("sounddevice não instalado.")
         return
-    print("\nSpeakers (saída de áudio):")
-    default_spk = sc.default_speaker()
-    for spk in sc.all_speakers():
-        marker = " ← padrão" if str(spk.name) == str(default_spk.name) else ""
-        print(f"  {spk.name}{marker}")
-    print("\nMicrofones / Loopbacks disponíveis:")
-    for mic in sc.all_microphones(include_loopback=True):
-        lb = " [loopback]" if getattr(mic, "isloopback", False) else ""
-        print(f"  {mic.name}{lb}")
+    devices = sd.query_devices()
+    default_in, default_out = sd.default.device
+    print(f"\n{'Idx':>4}  {'Saída':>5}  {'Entrada':>7}  Nome")
+    print("─" * 55)
+    for i, d in enumerate(devices):
+        out = d["max_output_channels"]
+        inp = d["max_input_channels"]
+        if out == 0 and inp == 0:
+            continue
+        marks = []
+        if i == default_out: marks.append("← saída padrão")
+        if i == default_in:  marks.append("← entrada padrão")
+        note = "  " + ", ".join(marks) if marks else ""
+        print(f"{i:>4}  {out:>5}  {inp:>7}  {d['name']}{note}")
+    print()
+    print("Para usar um dispositivo específico: --audio-device <Idx>")
     print()
 
 
@@ -489,8 +506,9 @@ def main():
     parser.add_argument("--fps",           type=int, default=60,    help="FPS alvo (padrão: 60)")
     parser.add_argument("--bitrate",       type=int, default=8000,  help="Bitrate de vídeo em kbps (padrão: 8000)")
     parser.add_argument("--scale",         type=int, default=0,     help="Largura de encoding em px, 0=nativo (ex: 1280 para 720p)")
-    parser.add_argument("--list-monitors", action="store_true", help="Lista monitores disponíveis e sai")
-    parser.add_argument("--list-audio",   action="store_true", help="Lista dispositivos de áudio e sai")
+    parser.add_argument("--audio-device",  type=int, default=-1,    help="Índice do dispositivo de saída para loopback (-1=padrão)")
+    parser.add_argument("--list-monitors", action="store_true",     help="Lista monitores disponíveis e sai")
+    parser.add_argument("--list-audio",    action="store_true",     help="Lista dispositivos de áudio e sai")
     _args = parser.parse_args()
 
     if _args.list_monitors:
