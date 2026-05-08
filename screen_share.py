@@ -38,16 +38,61 @@ from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger(__name__)
 
+# ─── Captura de cursor (Windows) ─────────────────────────────────────────────
+
+if sys.platform == "win32":
+    try:
+        import win32gui
+        import win32ui
+        import win32con
+        WIN32_OK = True
+    except ImportError:
+        WIN32_OK = False
+        log.warning("pywin32 não instalado — cursor não será capturado")
+        log.warning("  Instale com: venv\\Scripts\\pip install pywin32")
+else:
+    WIN32_OK = False
+
+
+def _grab_win32_cursor(left: int, top: int, width: int, height: int) -> np.ndarray:
+    """Captura tela + cursor usando a win32 API."""
+    hdesktop = win32gui.GetDesktopWindow()
+    desktop_dc = win32gui.GetWindowDC(hdesktop)
+    src_dc = win32ui.CreateDCFromHandle(desktop_dc)
+    mem_dc = src_dc.CreateCompatibleDC()
+    bmp = win32ui.CreateBitmap()
+    bmp.CreateCompatibleBitmap(src_dc, width, height)
+    mem_dc.SelectObject(bmp)
+    mem_dc.BitBlt((0, 0), (width, height), src_dc, (left, top), win32con.SRCCOPY)
+    try:
+        flags, hcursor, (cx, cy) = win32gui.GetCursorInfo()
+        if flags & 0x1:  # CURSOR_SHOWING
+            win32gui.DrawIconEx(
+                mem_dc.GetSafeHdc(),
+                cx - left, cy - top,
+                hcursor, 0, 0, 0, None,
+                win32con.DI_NORMAL,
+            )
+    except Exception:
+        pass
+    bmpstr = bmp.GetBitmapBits(True)
+    img = np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4).copy()
+    mem_dc.DeleteDC()
+    win32gui.DeleteObject(bmp.GetHandle())
+    win32gui.ReleaseDC(hdesktop, desktop_dc)
+    return img
+
+
 # ─── Tracks ──────────────────────────────────────────────────────────────────
 
 class ScreenVideoTrack(VideoStreamTrack):
-    """Captura a tela e serve como track de vídeo WebRTC."""
+    """Captura a tela (com cursor no Windows) e serve como track de vídeo WebRTC."""
 
     def __init__(self, monitor: int = 1, fps: int = 30):
         super().__init__()
         self._monitor = monitor
         self._fps = fps
-        self._sct = None        # instanciado na thread de captura
+        self._sct = None
 
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
@@ -62,12 +107,50 @@ class ScreenVideoTrack(VideoStreamTrack):
         if self._sct is None:
             self._sct = mss.mss()
         mon = self._sct.monitors[self._monitor]
+        if WIN32_OK:
+            return _grab_win32_cursor(mon["left"], mon["top"], mon["width"], mon["height"])
         raw = self._sct.grab(mon)
         return np.frombuffer(raw.raw, dtype=np.uint8).reshape(raw.height, raw.width, 4)
 
 
 try:
     import soundcard as sc
+
+    def _find_loopback_mic():
+        """Procura dispositivo de loopback para captura do áudio do sistema."""
+        # 1. Loopback do speaker padrão (nome exato)
+        try:
+            spk = sc.default_speaker()
+            mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
+            log.info(f"Áudio: loopback de '{spk.name}'")
+            return mic
+        except Exception as e:
+            log.debug(f"Loopback pelo nome falhou: {e}")
+
+        # 2. Qualquer mic marcado como loopback
+        try:
+            loopbacks = [m for m in sc.all_microphones(include_loopback=True)
+                         if getattr(m, "isloopback", False)]
+            if loopbacks:
+                log.info(f"Áudio: loopback automático '{loopbacks[0].name}'")
+                return loopbacks[0]
+        except Exception as e:
+            log.debug(f"Busca por loopbacks falhou: {e}")
+
+        # 3. Stereo Mix (Windows legado)
+        try:
+            mic = sc.get_microphone("Stereo Mix")
+            log.info("Áudio: usando Stereo Mix")
+            return mic
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "Nenhum dispositivo de loopback encontrado.\n"
+            "  Use --list-audio para ver os dispositivos disponíveis.\n"
+            "  No Windows: Painel de Som > Gravação > clique direito > "
+            "Mostrar dispositivos desativados > ativar 'Stereo Mix'"
+        )
 
     class SystemAudioTrack(AudioStreamTrack):
         """Captura o áudio do sistema (loopback) via soundcard."""
@@ -83,9 +166,7 @@ try:
 
         def _capture(self):
             try:
-                speaker = sc.default_speaker()
-                mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-                log.info(f"Áudio loopback: {speaker.name}")
+                mic = _find_loopback_mic()
                 with mic.recorder(samplerate=self.SAMPLE_RATE, channels=2) as rec:
                     while True:
                         data = rec.record(numframes=self.CHUNK)
@@ -95,7 +176,7 @@ try:
                         try:
                             fut.result(timeout=0.05)
                         except Exception:
-                            pass  # descarta frame se a fila estiver cheia
+                            pass
             except Exception as exc:
                 log.error(f"Captura de áudio falhou: {exc}")
 
@@ -273,6 +354,22 @@ async def on_shutdown(app: web.Application) -> None:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def list_audio():
+    if not AUDIO_OK:
+        print("soundcard não instalado.")
+        return
+    print("\nSpeakers (saída de áudio):")
+    default_spk = sc.default_speaker()
+    for spk in sc.all_speakers():
+        marker = " ← padrão" if str(spk.name) == str(default_spk.name) else ""
+        print(f"  {spk.name}{marker}")
+    print("\nMicrofones / Loopbacks disponíveis:")
+    for mic in sc.all_microphones(include_loopback=True):
+        lb = " [loopback]" if getattr(mic, "isloopback", False) else ""
+        print(f"  {mic.name}{lb}")
+    print()
+
+
 def list_monitors():
     with mss.mss() as sct:
         print(f"\n{'Idx':>4}  {'Resolução':>16}  {'Posição'}")
@@ -297,11 +394,16 @@ def main():
     parser.add_argument("--monitor",       type=int, default=1,    help="Índice do monitor (padrão: 1)")
     parser.add_argument("--fps",           type=int, default=60,    help="FPS alvo (padrão: 60)")
     parser.add_argument("--bitrate",       type=int, default=8000,  help="Bitrate de vídeo em kbps (padrão: 8000)")
-    parser.add_argument("--list-monitors", action="store_true",     help="Lista monitores disponíveis e sai")
+    parser.add_argument("--list-monitors", action="store_true", help="Lista monitores disponíveis e sai")
+    parser.add_argument("--list-audio",   action="store_true", help="Lista dispositivos de áudio e sai")
     _args = parser.parse_args()
 
     if _args.list_monitors:
         list_monitors()
+        return
+
+    if _args.list_audio:
+        list_audio()
         return
 
     app = web.Application()
