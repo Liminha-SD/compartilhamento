@@ -193,24 +193,24 @@ if AUDIO_OK:
             if dev is None:
                 raise RuntimeError("Nenhum dispositivo loopback WASAPI encontrado")
 
-            # Canais: loopbacks às vezes reportam maxInputChannels=0
-            ch = int(dev.get("maxInputChannels") or 0)
-            if ch == 0:
-                ch = int(dev.get("maxOutputChannels") or 2)
-            ch = min(max(ch, 1), 2)
+            # Usa o número nativo de canais do dispositivo — WASAPI loopback
+            # não aceita valor diferente do nativo (pode ser 6, 8, etc.)
+            ch_in  = int(dev.get("maxInputChannels") or 0)
+            ch_out = int(dev.get("maxOutputChannels") or 0)
+            native_ch = ch_in if ch_in > 0 else (ch_out if ch_out > 0 else 2)
 
             rate  = int(dev.get("defaultSampleRate") or 48000)
             chunk = max(rate // 50, 64)  # ~20 ms
 
             stream = pa.open(
                 format=_pawp.paFloat32,
-                channels=ch,
+                channels=native_ch,
                 rate=rate,
                 frames_per_buffer=chunk,
                 input=True,
                 input_device_index=int(dev["index"]),
             )
-            return stream, dev["name"], ch, rate, chunk
+            return stream, dev["name"], native_ch, rate, chunk
 
         def _capture(self) -> None:
             while True:
@@ -225,10 +225,15 @@ if AUDIO_OK:
                     while True:
                         raw  = stream.read(chunk, exception_on_overflow=False)
                         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
+                        # Downmix para estéreo: mono→duplica, >2ch→pega L+R
                         if ch == 1:
-                            data = np.repeat(data, 2, axis=1)
+                            stereo = np.repeat(data, 2, axis=1)
+                        elif ch == 2:
+                            stereo = data
+                        else:
+                            stereo = data[:, :2]
                         # float32 → int16 packed s16 (1, N*2) — exigido pelo encoder Opus do aiortc
-                        pcm    = (np.clip(data[:, :2], -1.0, 1.0) * 32767).astype(np.int16)
+                        pcm    = (np.clip(stereo, -1.0, 1.0) * 32767).astype(np.int16)
                         packed = pcm.flatten().reshape(1, -1).copy()
                         n      = len(data)
                         fut    = asyncio.run_coroutine_threadsafe(
