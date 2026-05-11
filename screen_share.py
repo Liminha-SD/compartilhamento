@@ -159,65 +159,80 @@ try:
             raise RuntimeError(f"WASAPI loopback não encontrado: {e}")
 
     class SystemAudioTrack(AudioStreamTrack):
-        SAMPLE_RATE = 48000
-        CHUNK       = 960   # 20 ms @ 48 kHz
-
         def __init__(self, device: int = -1):
             super().__init__()
-            self._device    = device
-            self._pts       = 0
-            self._time_base = fractions.Fraction(1, self.SAMPLE_RATE)
+            self._device      = device
+            self._pts         = 0
+            self._sample_rate = 48000
+            self._time_base   = fractions.Fraction(1, 48000)
             self._queue: asyncio.Queue = asyncio.Queue(maxsize=8)
-            self._loop = asyncio.get_event_loop()
+            self._loop = asyncio.get_running_loop()
             threading.Thread(target=self._capture, daemon=True).start()
 
         def _capture(self) -> None:
-            pa = stream = None
-            try:
-                dev, pa  = _find_wasapi_loopback(self._device)
-                channels = min(int(dev["maxInputChannels"]), 2)
-                stream   = pa.open(
-                    format=pyaudio.paFloat32,
-                    channels=channels,
-                    rate=self.SAMPLE_RATE,
-                    frames_per_buffer=self.CHUNK,
-                    input=True,
-                    input_device_index=int(dev["index"]),
-                )
-                log.info(f"Áudio capturando: {dev['name']} @ {self.SAMPLE_RATE}Hz {channels}ch")
-                while True:
-                    raw  = stream.read(self.CHUNK, exception_on_overflow=False)
-                    data = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
-                    if channels == 1:
-                        data = np.repeat(data, 2, axis=1)
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self._queue.put(data[:, :2]), self._loop
+            while True:
+                pa = stream = None
+                try:
+                    dev, pa = _find_wasapi_loopback(self._device)
+
+                    # loopback devices às vezes reportam maxInputChannels=0;
+                    # nesse caso usamos maxOutputChannels como fallback
+                    ch_in  = int(dev.get("maxInputChannels",  0))
+                    ch_out = int(dev.get("maxOutputChannels", 0))
+                    channels = min(ch_in if ch_in > 0 else ch_out, 2) or 2
+
+                    # usa o sample rate nativo do dispositivo
+                    native_rate = int(dev.get("defaultSampleRate", 48000))
+                    chunk = max(native_rate // 50, 64)  # ~20 ms
+
+                    stream = pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=channels,
+                        rate=native_rate,
+                        frames_per_buffer=chunk,
+                        input=True,
+                        input_device_index=int(dev["index"]),
                     )
-                    try:
-                        fut.result(timeout=0.05)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                log.error(f"Captura de áudio falhou: {exc}")
-            finally:
-                if stream:
-                    try: stream.stop_stream(); stream.close()
-                    except Exception: pass
-                if pa:
-                    try: pa.terminate()
-                    except Exception: pass
+                    self._sample_rate = native_rate
+                    self._time_base   = fractions.Fraction(1, native_rate)
+
+                    log.info(f"Áudio capturando: {dev['name']} @ {native_rate}Hz {channels}ch")
+
+                    while True:
+                        raw  = stream.read(chunk, exception_on_overflow=False)
+                        data = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+                        if channels == 1:
+                            data = np.repeat(data, 2, axis=1)
+                        fut = asyncio.run_coroutine_threadsafe(
+                            self._queue.put(data[:, :2]), self._loop
+                        )
+                        try:
+                            fut.result(timeout=0.2)
+                        except Exception:
+                            pass  # descarta frame se a fila estiver cheia
+
+                except Exception as exc:
+                    log.error(f"Captura de áudio falhou: {exc} — tentando novamente em 2s")
+                    time.sleep(2)
+                finally:
+                    if stream:
+                        try: stream.stop_stream(); stream.close()
+                        except Exception: pass
+                    if pa:
+                        try: pa.terminate()
+                        except Exception: pass
 
         async def recv(self) -> av.AudioFrame:
             try:
                 data = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
-                data = np.zeros((self.CHUNK, 2), dtype=np.float32)
+                data = np.zeros((self._sample_rate // 50, 2), dtype=np.float32)
             pcm   = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
-            frame = av.AudioFrame.from_ndarray(pcm.T, format="s16p", layout="stereo")
+            frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(pcm.T), format="s16p", layout="stereo")
             frame.pts         = self._pts
             frame.time_base   = self._time_base
-            frame.sample_rate = self.SAMPLE_RATE
-            self._pts        += self.CHUNK
+            frame.sample_rate = self._sample_rate
+            self._pts        += len(data)  # avança pelo nº real de amostras
             return frame
 
     AUDIO_OK = True
