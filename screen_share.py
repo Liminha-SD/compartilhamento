@@ -13,7 +13,6 @@ import json
 import logging
 import queue as _queue
 import socket
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -120,76 +119,120 @@ class ScreenVideoTrack(VideoStreamTrack):
 
 try:
     import pyaudiowpatch as _pawp
+    AUDIO_OK = True
 except ImportError:
-    _pawp = None
+    _pawp    = None
+    AUDIO_OK = False
+    log.warning("pyaudiowpatch não instalado — áudio desativado")
 
-try:
-    import imageio_ffmpeg as _iio_ffmpeg
-except ImportError:
-    _iio_ffmpeg = None
 
-if _pawp is not None and _iio_ffmpeg is not None:
+def get_loopback_devices() -> dict[str, str]:
+    """Retorna {nome_dispositivo: nome_dispositivo} dos dispositivos de áudio."""
+    if not AUDIO_OK:
+        return {}
+    pa      = _pawp.PyAudio()
+    devices: dict[str, str] = {}
+    try:
+        loopback_indices: set[int] = set()
+        for lb in pa.get_loopback_device_info_generator():
+            loopback_indices.add(int(lb["index"]))
+            devices[lb["name"]] = lb["name"]
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if int(info["maxInputChannels"]) > 0 and i not in loopback_indices:
+                devices[info["name"]] = info["name"]
+    finally:
+        pa.terminate()
+    return devices
 
-    def get_loopback_devices() -> dict[str, str]:
-        """Retorna {nome_exibição: nome_ffmpeg} dos dispositivos de áudio."""
-        pa      = _pawp.PyAudio()
-        devices: dict[str, str] = {}
-        try:
-            loopback_indices: set[int] = set()
-            for lb in pa.get_loopback_device_info_generator():
-                idx = int(lb["index"])
-                loopback_indices.add(idx)
-                raw_name    = lb["name"]
-                ffmpeg_name = raw_name.removesuffix(" [Loopback]").strip()
-                devices[raw_name] = ffmpeg_name
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if int(info["maxInputChannels"]) > 0 and i not in loopback_indices:
-                    devices[info["name"]] = info["name"]
-        finally:
-            pa.terminate()
-        return devices
 
+if AUDIO_OK:
     class SystemAudioTrack(AudioStreamTrack):
-        SAMPLE_RATE = 48000
-        CHUNK       = 960            # 20 ms @ 48 kHz
-        CHUNK_BYTES = CHUNK * 2 * 2  # stereo × int16
+        CHUNK = 960  # 20 ms @ 48 kHz
 
         def __init__(self, device_name: str = ""):
             super().__init__()
             self._device_name = device_name
             self._pts         = 0
-            self._time_base   = fractions.Fraction(1, self.SAMPLE_RATE)
+            self._sample_rate = 48000
+            self._time_base   = fractions.Fraction(1, 48000)
             self._queue: asyncio.Queue = asyncio.Queue(maxsize=8)
             self._loop = asyncio.get_running_loop()
             threading.Thread(target=self._capture, daemon=True).start()
 
-        def _capture(self) -> None:
-            ffmpeg_exe = _iio_ffmpeg.get_ffmpeg_exe()
-            while True:
-                proc = None
+        def _open(self, pa):
+            """Abre stream loopback WASAPI. Retorna (stream, nome, canais, rate, chunk)."""
+            dev = None
+
+            # 1) Tenta encontrar pelo nome selecionado na GUI
+            if self._device_name:
+                for i in range(pa.get_device_count()):
+                    info = pa.get_device_info_by_index(i)
+                    if self._device_name in info["name"] or info["name"] in self._device_name:
+                        dev = info
+                        break
+
+            # 2) Auto-detect: loopback que corresponde à saída padrão WASAPI
+            if dev is None:
                 try:
-                    cmd = [
-                        ffmpeg_exe, "-loglevel", "quiet",
-                        "-f", "wasapi", "-loopback", "1",
-                        "-i", self._device_name or "default",
-                        "-f", "s16le",
-                        "-ar", str(self.SAMPLE_RATE),
-                        "-ac", "2",
-                        "pipe:1",
-                    ]
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                            stderr=subprocess.DEVNULL)
-                    log.info(f"FFmpeg áudio: '{self._device_name or 'default'}' @ {self.SAMPLE_RATE}Hz")
+                    wasapi  = pa.get_host_api_info_by_type(_pawp.paWASAPI)
+                    default = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+                    for lb in pa.get_loopback_device_info_generator():
+                        if default["name"] in lb["name"]:
+                            dev = lb
+                            break
+                except Exception:
+                    pass
+
+            # 3) Qualquer loopback disponível
+            if dev is None:
+                for lb in pa.get_loopback_device_info_generator():
+                    dev = lb
+                    break
+
+            if dev is None:
+                raise RuntimeError("Nenhum dispositivo loopback WASAPI encontrado")
+
+            # Canais: loopbacks às vezes reportam maxInputChannels=0
+            ch = int(dev.get("maxInputChannels") or 0)
+            if ch == 0:
+                ch = int(dev.get("maxOutputChannels") or 2)
+            ch = min(max(ch, 1), 2)
+
+            rate  = int(dev.get("defaultSampleRate") or 48000)
+            chunk = max(rate // 50, 64)  # ~20 ms
+
+            stream = pa.open(
+                format=_pawp.paFloat32,
+                channels=ch,
+                rate=rate,
+                frames_per_buffer=chunk,
+                input=True,
+                input_device_index=int(dev["index"]),
+            )
+            return stream, dev["name"], ch, rate, chunk
+
+        def _capture(self) -> None:
+            while True:
+                pa = stream = None
+                try:
+                    pa = _pawp.PyAudio()
+                    stream, dev_name, ch, rate, chunk = self._open(pa)
+                    self._sample_rate = rate
+                    self._time_base   = fractions.Fraction(1, rate)
+                    log.info(f"Áudio WASAPI: {dev_name} @ {rate}Hz {ch}ch")
 
                     while True:
-                        raw = proc.stdout.read(self.CHUNK_BYTES)
-                        if len(raw) < self.CHUNK_BYTES:
-                            log.warning("FFmpeg áudio: stream encerrado — reconectando")
-                            break
-                        data = np.frombuffer(raw, dtype=np.int16).reshape(1, -1)
-                        fut  = asyncio.run_coroutine_threadsafe(
-                            self._queue.put(data), self._loop
+                        raw  = stream.read(chunk, exception_on_overflow=False)
+                        data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
+                        if ch == 1:
+                            data = np.repeat(data, 2, axis=1)
+                        # float32 → int16 packed s16 (1, N*2) — exigido pelo encoder Opus do aiortc
+                        pcm    = (np.clip(data[:, :2], -1.0, 1.0) * 32767).astype(np.int16)
+                        packed = pcm.flatten().reshape(1, -1).copy()
+                        n      = len(data)
+                        fut    = asyncio.run_coroutine_threadsafe(
+                            self._queue.put((packed, n)), self._loop
                         )
                         try:
                             fut.result(timeout=0.2)
@@ -197,33 +240,28 @@ if _pawp is not None and _iio_ffmpeg is not None:
                             pass
 
                 except Exception as exc:
-                    log.error(f"FFmpeg áudio falhou: {exc} — tentando em 2s")
+                    log.error(f"Áudio falhou: {exc} — tentando em 2s")
                     time.sleep(2)
                 finally:
-                    if proc:
-                        try: proc.kill(); proc.wait()
+                    if stream:
+                        try: stream.stop_stream(); stream.close()
+                        except Exception: pass
+                    if pa:
+                        try: pa.terminate()
                         except Exception: pass
 
         async def recv(self) -> av.AudioFrame:
             try:
-                data = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                packed, n = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
-                data = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
-            frame = av.AudioFrame.from_ndarray(data, format="s16", layout="stereo")
+                packed = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
+                n      = self.CHUNK
+            frame = av.AudioFrame.from_ndarray(packed, format="s16", layout="stereo")
             frame.pts         = self._pts
             frame.time_base   = self._time_base
-            frame.sample_rate = self.SAMPLE_RATE
-            self._pts        += self.CHUNK
+            frame.sample_rate = self._sample_rate
+            self._pts        += n
             return frame
-
-    AUDIO_OK = True
-
-else:
-    AUDIO_OK = False
-    _missing = [n for n, m in [("pyaudiowpatch", _pawp), ("imageio-ffmpeg", _iio_ffmpeg)] if m is None]
-    log.warning(f"Áudio desativado: {', '.join(_missing)} não instalado(s)")
-    def get_loopback_devices() -> dict[str, str]:
-        return {}
 
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
@@ -688,7 +726,7 @@ class MainWindow(QMainWindow):
         except Exception: pass
 
         if AUDIO_OK:
-            log.info(f"FFmpeg áudio: dispositivo='{_config.audio_device or 'default'}'")
+            log.info(f"Áudio WASAPI: dispositivo='{_config.audio_device or 'auto'}'")
 
 
         app = web.Application()
