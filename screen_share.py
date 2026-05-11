@@ -199,8 +199,10 @@ if AUDIO_OK:
             ch_out = int(dev.get("maxOutputChannels") or 0)
             native_ch = ch_in if ch_in > 0 else (ch_out if ch_out > 0 else 2)
 
-            rate  = int(dev.get("defaultSampleRate") or 48000)
-            chunk = max(rate // 50, 64)  # ~20 ms
+            # Força 48 kHz — Opus aceita apenas 8/12/16/24/48 kHz (não 44100 Hz)
+            # WASAPI shared-mode faz o resampling automaticamente
+            rate  = 48000
+            chunk = 960  # exatamente 20 ms @ 48 kHz
 
             stream = pa.open(
                 format=_pawp.paFloat32,
@@ -210,39 +212,36 @@ if AUDIO_OK:
                 input=True,
                 input_device_index=int(dev["index"]),
             )
-            return stream, dev["name"], native_ch, rate, chunk
+            return stream, dev["name"], native_ch, chunk
 
         def _capture(self) -> None:
+            # put_nowait seguro para chamar do event loop via call_soon_threadsafe
+            def _try_put(item):
+                try:
+                    self._queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    pass  # descarta frame; nunca deixa coroutine pendurada
+
             while True:
                 pa = stream = None
                 try:
                     pa = _pawp.PyAudio()
-                    stream, dev_name, ch, rate, chunk = self._open(pa)
-                    self._sample_rate = rate
-                    self._time_base   = fractions.Fraction(1, rate)
-                    log.info(f"Áudio WASAPI: {dev_name} @ {rate}Hz {ch}ch")
+                    stream, dev_name, ch, chunk = self._open(pa)
+                    log.info(f"Áudio WASAPI: {dev_name} @ 48000Hz {ch}ch")
 
                     while True:
                         raw  = stream.read(chunk, exception_on_overflow=False)
                         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
-                        # Downmix para estéreo: mono→duplica, >2ch→pega L+R
+                        # downmix para estéreo
                         if ch == 1:
                             stereo = np.repeat(data, 2, axis=1)
                         elif ch == 2:
                             stereo = data
                         else:
                             stereo = data[:, :2]
-                        # float32 → int16 packed s16 (1, N*2) — exigido pelo encoder Opus do aiortc
                         pcm    = (np.clip(stereo, -1.0, 1.0) * 32767).astype(np.int16)
                         packed = pcm.flatten().reshape(1, -1).copy()
-                        n      = len(data)
-                        fut    = asyncio.run_coroutine_threadsafe(
-                            self._queue.put((packed, n)), self._loop
-                        )
-                        try:
-                            fut.result(timeout=0.2)
-                        except Exception:
-                            pass
+                        self._loop.call_soon_threadsafe(_try_put, packed)
 
                 except Exception as exc:
                     log.error(f"Áudio falhou: {exc} — tentando em 2s")
@@ -257,15 +256,14 @@ if AUDIO_OK:
 
         async def recv(self) -> av.AudioFrame:
             try:
-                packed, n = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                packed = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 packed = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
-                n      = self.CHUNK
             frame = av.AudioFrame.from_ndarray(packed, format="s16", layout="stereo")
             frame.pts         = self._pts
             frame.time_base   = self._time_base
             frame.sample_rate = self._sample_rate
-            self._pts        += n
+            self._pts        += self.CHUNK
             return frame
 
 
