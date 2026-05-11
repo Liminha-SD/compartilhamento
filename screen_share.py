@@ -213,7 +213,7 @@ try:
             except asyncio.TimeoutError:
                 data = np.zeros((self.CHUNK, 2), dtype=np.float32)
             pcm   = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
-            frame = av.AudioFrame.from_ndarray(pcm.T, format="s16", layout="stereo")
+            frame = av.AudioFrame.from_ndarray(pcm.T, format="s16p", layout="stereo")
             frame.pts         = self._pts
             frame.time_base   = self._time_base
             frame.sample_rate = self.SAMPLE_RATE
