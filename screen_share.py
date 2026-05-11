@@ -139,7 +139,9 @@ if _pawp is not None and _iio_ffmpeg is not None:
             for lb in pa.get_loopback_device_info_generator():
                 idx = int(lb["index"])
                 loopback_indices.add(idx)
-                devices[f"[Loopback] {lb['name']}"] = lb["name"]
+                raw_name    = lb["name"]
+                ffmpeg_name = raw_name.removesuffix(" [Loopback]").strip()
+                devices[raw_name] = ffmpeg_name
             for i in range(pa.get_device_count()):
                 info = pa.get_device_info_by_index(i)
                 if int(info["maxInputChannels"]) > 0 and i not in loopback_indices:
