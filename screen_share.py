@@ -121,12 +121,22 @@ try:
     import pyaudiowpatch as pyaudio
 
     def get_loopback_devices() -> dict[str, int]:
-        """Retorna {nome: índice} dos dispositivos de loopback WASAPI."""
+        """Retorna {nome: índice} de todos os dispositivos de áudio disponíveis."""
         pa      = pyaudio.PyAudio()
         devices: dict[str, int] = {}
         try:
+            # Loopbacks WASAPI (captura de saída do sistema)
+            loopback_indices: set[int] = set()
             for lb in pa.get_loopback_device_info_generator():
-                devices[lb["name"]] = int(lb["index"])
+                idx  = int(lb["index"])
+                devices[f"[Loopback] {lb['name']}"] = idx
+                loopback_indices.add(idx)
+
+            # Demais dispositivos de entrada (microfones, etc.)
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                if int(info["maxInputChannels"]) > 0 and i not in loopback_indices:
+                    devices[info["name"]] = i
         finally:
             pa.terminate()
         return devices
