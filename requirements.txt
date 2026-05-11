@@ -5,3 +5,4 @@ numpy>=1.24.0
 av>=16.0.0
 pyaudiowpatch>=0.2.12.5  # WASAPI loopback no Windows
 pywin32>=306        # Windows only — cursor capture
+PySide6>=6.6.0
