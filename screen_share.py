@@ -73,11 +73,13 @@ class ScreenVideoTrack(VideoStreamTrack):
 
     def __init__(self, monitor: int = 1, fps: int = 60, scale_width: int = 0):
         super().__init__()
-        self._monitor = monitor
-        self._fps     = fps
-        self._scale_w = scale_width
+        self._monitor   = monitor
+        self._fps       = fps
+        self._scale_w   = scale_width
         self._latest: np.ndarray | None = None
-        self._lock    = threading.Lock()
+        self._lock      = threading.Lock()
+        self._new_frame = asyncio.Event()
+        self._loop      = asyncio.get_running_loop()
         threading.Thread(target=self._capture_loop, daemon=True).start()
 
     def _capture_loop(self) -> None:
@@ -85,6 +87,7 @@ class ScreenVideoTrack(VideoStreamTrack):
             mon      = sct.monitors[self._monitor]
             left, top, w, h = mon["left"], mon["top"], mon["width"], mon["height"]
             interval = 1.0 / (self._fps + 10)
+            sw = self._scale_w  # cache before loop to avoid repeated attr lookup
             while True:
                 t0 = time.monotonic()
                 if WIN32_OK:
@@ -92,24 +95,25 @@ class ScreenVideoTrack(VideoStreamTrack):
                 else:
                     raw = sct.grab(mon)
                     img = np.frombuffer(raw.raw, dtype=np.uint8).reshape(h, w, 4)
+                # scaling here keeps event loop free for WebRTC work
+                if sw and img.shape[1] != sw:
+                    sh  = int(h * sw / w) & ~1
+                    tmp = av.VideoFrame.from_ndarray(img, format="bgra")
+                    img = tmp.reformat(width=sw, height=sh).to_ndarray(format="bgra")
                 with self._lock:
                     self._latest = img
-                sleep = interval - (time.monotonic() - t0)
-                if sleep > 0:
-                    time.sleep(sleep)
+                self._loop.call_soon_threadsafe(self._new_frame.set)
+                elapsed = time.monotonic() - t0
+                if interval - elapsed > 0:
+                    time.sleep(interval - elapsed)
 
     async def recv(self) -> av.VideoFrame:
+        await self._new_frame.wait()
+        self._new_frame.clear()
         pts, time_base = await self.next_timestamp()
         with self._lock:
             img = self._latest
-        if img is None:
-            await asyncio.sleep(0.02)
-            with self._lock:
-                img = self._latest
         frame = av.VideoFrame.from_ndarray(img, format="bgra")
-        if self._scale_w and frame.width != self._scale_w:
-            scale_h = int(frame.height * self._scale_w / frame.width) & ~1
-            frame   = frame.reformat(width=self._scale_w, height=scale_h)
         frame.pts       = pts
         frame.time_base = time_base
         return frame
@@ -148,7 +152,7 @@ def get_loopback_devices() -> dict[str, str]:
 
 if AUDIO_OK:
     class SystemAudioTrack(AudioStreamTrack):
-        CHUNK = 960  # 20 ms @ 48 kHz
+        CHUNK = 480  # 10 ms @ 48 kHz — half the default for lower audio latency
 
         def __init__(self, device_name: str = ""):
             super().__init__()
@@ -156,9 +160,14 @@ if AUDIO_OK:
             self._pts         = 0
             self._sample_rate = 48000
             self._time_base   = fractions.Fraction(1, 48000)
-            self._queue: asyncio.Queue = asyncio.Queue(maxsize=8)
-            self._loop = asyncio.get_running_loop()
+            self._queue: asyncio.Queue = asyncio.Queue(maxsize=2)  # max 40ms de buffer
+            self._loop  = asyncio.get_running_loop()
+            self._stop  = threading.Event()
             threading.Thread(target=self._capture, daemon=True).start()
+
+        def stop(self):
+            self._stop.set()
+            super().stop()
 
         def _open(self, pa):
             """Abre stream loopback WASAPI. Retorna (stream, nome, canais, rate, chunk)."""
@@ -215,24 +224,26 @@ if AUDIO_OK:
             return stream, dev["name"], native_ch, chunk
 
         def _capture(self) -> None:
-            # put_nowait seguro para chamar do event loop via call_soon_threadsafe
             def _try_put(item):
                 try:
                     self._queue.put_nowait(item)
                 except asyncio.QueueFull:
-                    pass  # descarta frame; nunca deixa coroutine pendurada
+                    pass
 
-            while True:
+            while not self._stop.is_set():
                 pa = stream = None
                 try:
                     pa = _pawp.PyAudio()
                     stream, dev_name, ch, chunk = self._open(pa)
+                    # flush any frames queued before this peer connected
+                    while not self._queue.empty():
+                        try: self._queue.get_nowait()
+                        except Exception: break
                     log.info(f"Áudio WASAPI: {dev_name} @ 48000Hz {ch}ch")
 
-                    while True:
+                    while not self._stop.is_set():
                         raw  = stream.read(chunk, exception_on_overflow=False)
                         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
-                        # downmix para estéreo
                         if ch == 1:
                             stereo = np.repeat(data, 2, axis=1)
                         elif ch == 2:
@@ -244,8 +255,9 @@ if AUDIO_OK:
                         self._loop.call_soon_threadsafe(_try_put, packed)
 
                 except Exception as exc:
-                    log.error(f"Áudio falhou: {exc} — tentando em 2s")
-                    time.sleep(2)
+                    if not self._stop.is_set():
+                        log.error(f"Áudio falhou: {exc} — tentando em 2s")
+                        time.sleep(2)
                 finally:
                     if stream:
                         try: stream.stop_stream(); stream.close()
@@ -326,7 +338,7 @@ HTML = """<!DOCTYPE html>
         const s = pc.connectionState;
         if (s === 'connected') { clearTimeout(reconnectTimer); isConnecting = false; }
         else if (s === 'failed') { status('⚠ falhou', '#f44'); scheduleReconnect(1500); }
-        else if (s === 'disconnected') { status('⚠ desconectado', '#fa0'); scheduleReconnect(8000); }
+        else if (s === 'disconnected') { status('⚠ desconectado', '#fa0'); scheduleReconnect(2000); }
       };
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -335,7 +347,7 @@ HTML = """<!DOCTYPE html>
       await new Promise(r => {
         if (pc.iceGatheringState === 'complete') return r();
         pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') r(); });
-        setTimeout(r, 5000);
+        setTimeout(r, 2000);
       });
       const res = await fetch('/offer', {
         method: 'POST',
@@ -376,13 +388,24 @@ async def handle_index(request: web.Request) -> web.Response:
 
 
 def _patch_sdp_bitrate(sdp: str, kbps: int) -> str:
+    """Patch SDP answer: inject video bitrate cap and Opus low-latency params."""
     lines = sdp.split("\r\n")
-    out, in_video, injected = [], False, False
+    out = []
+    in_video = in_audio = False
+    video_b_injected = False
     for line in lines:
         if line.startswith("m="):
-            in_video = line.startswith("m=video"); injected = False
-        if in_video and not injected and line.startswith("a="):
-            out.append(f"b=AS:{kbps}"); injected = True
+            in_video = line.startswith("m=video")
+            in_audio = line.startswith("m=audio")
+            video_b_injected = False
+        # inject b=AS before first a= line in the video section
+        if in_video and not video_b_injected and line.startswith("a="):
+            out.append(f"b=AS:{kbps}")
+            video_b_injected = True
+        # Opus: append low-latency params if not already present
+        if in_audio and line.startswith("a=fmtp:") and "minptime" not in line:
+            out.append(line + ";minptime=10;useinbandfec=1;stereo=1")
+            continue
         out.append(line)
     return "\r\n".join(out)
 
