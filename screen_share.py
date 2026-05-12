@@ -152,7 +152,7 @@ def get_loopback_devices() -> dict[str, str]:
 
 if AUDIO_OK:
     class SystemAudioTrack(AudioStreamTrack):
-        CHUNK = 480  # 10 ms @ 48 kHz — half the default for lower audio latency
+        CHUNK = 960  # 20 ms @ 48 kHz (Opus standard frame)
 
         def __init__(self, device_name: str = ""):
             super().__init__()
@@ -211,7 +211,7 @@ if AUDIO_OK:
             # Força 48 kHz — Opus aceita apenas 8/12/16/24/48 kHz (não 44100 Hz)
             # WASAPI shared-mode faz o resampling automaticamente
             rate  = 48000
-            chunk = 960  # exatamente 20 ms @ 48 kHz
+            chunk = self.CHUNK  # deve sempre bater com CHUNK para o PTS ficar correto
 
             stream = pa.open(
                 format=_pawp.paFloat32,
