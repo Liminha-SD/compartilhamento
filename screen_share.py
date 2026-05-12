@@ -71,15 +71,20 @@ def _grab_win32_cursor(left: int, top: int, width: int, height: int) -> np.ndarr
 class ScreenVideoTrack(VideoStreamTrack):
     """Captura contínua em thread dedicada — frame sempre pronto para WebRTC."""
 
+    # Relógio de vídeo WebRTC padrão: 90 kHz
+    _V_CLOCK = 90000
+
     def __init__(self, monitor: int = 1, fps: int = 60, scale_width: int = 0):
         super().__init__()
-        self._monitor   = monitor
-        self._fps       = fps
-        self._scale_w   = scale_width
+        self._monitor      = monitor
+        self._fps          = fps
+        self._scale_w      = scale_width
         self._latest: np.ndarray | None = None
-        self._lock      = threading.Lock()
-        self._new_frame = asyncio.Event()
-        self._loop      = asyncio.get_running_loop()
+        self._cap_time: float            = 0.0   # monotonic time do último frame capturado
+        self._lock         = threading.Lock()
+        self._new_frame    = asyncio.Event()
+        self._loop         = asyncio.get_running_loop()
+        self._v_epoch: float | None = None        # ancoragem no primeiro frame
         threading.Thread(target=self._capture_loop, daemon=True).start()
 
     def _capture_loop(self) -> None:
@@ -87,7 +92,7 @@ class ScreenVideoTrack(VideoStreamTrack):
             mon      = sct.monitors[self._monitor]
             left, top, w, h = mon["left"], mon["top"], mon["width"], mon["height"]
             interval = 1.0 / (self._fps + 10)
-            sw = self._scale_w  # cache before loop to avoid repeated attr lookup
+            sw = self._scale_w
             while True:
                 t0 = time.monotonic()
                 if WIN32_OK:
@@ -95,27 +100,32 @@ class ScreenVideoTrack(VideoStreamTrack):
                 else:
                     raw = sct.grab(mon)
                     img = np.frombuffer(raw.raw, dtype=np.uint8).reshape(h, w, 4)
-                # scaling here keeps event loop free for WebRTC work
                 if sw and img.shape[1] != sw:
                     sh  = int(h * sw / w) & ~1
                     tmp = av.VideoFrame.from_ndarray(img, format="bgra")
                     img = tmp.reformat(width=sw, height=sh).to_ndarray(format="bgra")
+                cap_time = time.monotonic()
                 with self._lock:
-                    self._latest = img
+                    self._latest  = img
+                    self._cap_time = cap_time
                 self._loop.call_soon_threadsafe(self._new_frame.set)
-                elapsed = time.monotonic() - t0
+                elapsed = cap_time - t0
                 if interval - elapsed > 0:
                     time.sleep(interval - elapsed)
 
     async def recv(self) -> av.VideoFrame:
         await self._new_frame.wait()
         self._new_frame.clear()
-        pts, time_base = await self.next_timestamp()
         with self._lock:
-            img = self._latest
+            img      = self._latest
+            cap_time = self._cap_time
+        # PTS ancorado no tempo de captura real — mesmo relógio do áudio
+        if self._v_epoch is None:
+            self._v_epoch = cap_time
+        pts = int((cap_time - self._v_epoch) * self._V_CLOCK)
         frame = av.VideoFrame.from_ndarray(img, format="bgra")
         frame.pts       = pts
-        frame.time_base = time_base
+        frame.time_base = fractions.Fraction(1, self._V_CLOCK)
         return frame
 
 
@@ -157,12 +167,13 @@ if AUDIO_OK:
         def __init__(self, device_name: str = ""):
             super().__init__()
             self._device_name = device_name
-            self._pts         = 0
             self._sample_rate = 48000
             self._time_base   = fractions.Fraction(1, 48000)
-            self._queue: asyncio.Queue = asyncio.Queue(maxsize=2)  # max 40ms de buffer
+            # itens: (packed_pcm, capture_monotonic_time)
+            self._queue: asyncio.Queue = asyncio.Queue(maxsize=4)  # ~80 ms de buffer
             self._loop  = asyncio.get_running_loop()
             self._stop  = threading.Event()
+            self._epoch: float | None = None   # âncora do primeiro frame capturado
             threading.Thread(target=self._capture, daemon=True).start()
 
         def stop(self):
@@ -224,25 +235,29 @@ if AUDIO_OK:
             return stream, dev["name"], native_ch, chunk
 
         def _capture(self) -> None:
-            def _try_put(item):
-                try:
-                    self._queue.put_nowait(item)
-                except asyncio.QueueFull:
-                    pass
+            def _put_fresh(item):
+                # descarta o frame mais antigo se a fila estiver cheia —
+                # garante que o browser sempre recebe áudio atual, nunca velho
+                if self._queue.full():
+                    try: self._queue.get_nowait()
+                    except asyncio.QueueEmpty: pass
+                try: self._queue.put_nowait(item)
+                except asyncio.QueueFull: pass
 
             while not self._stop.is_set():
                 pa = stream = None
                 try:
                     pa = _pawp.PyAudio()
                     stream, dev_name, ch, chunk = self._open(pa)
-                    # flush any frames queued before this peer connected
+                    # descarta frames acumulados antes do peer conectar
                     while not self._queue.empty():
                         try: self._queue.get_nowait()
                         except Exception: break
                     log.info(f"Áudio WASAPI: {dev_name} @ 48000Hz {ch}ch")
 
                     while not self._stop.is_set():
-                        raw  = stream.read(chunk, exception_on_overflow=False)
+                        raw          = stream.read(chunk, exception_on_overflow=False)
+                        capture_time = time.monotonic()
                         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
                         if ch == 1:
                             stereo = np.repeat(data, 2, axis=1)
@@ -252,7 +267,7 @@ if AUDIO_OK:
                             stereo = data[:, :2]
                         pcm    = (np.clip(stereo, -1.0, 1.0) * 32767).astype(np.int16)
                         packed = pcm.flatten().reshape(1, -1).copy()
-                        self._loop.call_soon_threadsafe(_try_put, packed)
+                        self._loop.call_soon_threadsafe(_put_fresh, (packed, capture_time))
 
                 except Exception as exc:
                     if not self._stop.is_set():
@@ -268,14 +283,22 @@ if AUDIO_OK:
 
         async def recv(self) -> av.AudioFrame:
             try:
-                packed = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                packed, capture_time = await asyncio.wait_for(
+                    self._queue.get(), timeout=0.5
+                )
             except asyncio.TimeoutError:
-                packed = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
+                packed       = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
+                capture_time = time.monotonic()
+
+            if self._epoch is None:
+                self._epoch = capture_time
+            # PTS em ticks do relógio de áudio (48 kHz) — mesmo relógio do vídeo
+            pts = int((capture_time - self._epoch) * self._sample_rate)
+
             frame = av.AudioFrame.from_ndarray(packed, format="s16", layout="stereo")
-            frame.pts         = self._pts
+            frame.pts         = pts
             frame.time_base   = self._time_base
             frame.sample_rate = self._sample_rate
-            self._pts        += self.CHUNK
             return frame
 
 
