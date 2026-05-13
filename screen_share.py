@@ -400,6 +400,58 @@ _config = Config()
 _pcs: set[RTCPeerConnection] = set()
 
 
+# ─── NVENC GPU encoder ────────────────────────────────────────────────────────
+
+def _try_enable_nvenc() -> bool:
+    """Tenta substituir o encoder H264 do aiortc por h264_nvenc (GPU NVIDIA).
+
+    Opções de baixíssima latência:
+      preset=p1  → perfil mais rápido do NVENC Ampere
+      tune=ull   → ultra-low-latency (sem B-frames, buffer mínimo)
+      rc=cbr     → bitrate constante (estável na rede)
+      bf=0       → zero B-frames (cada frame é referência, sem atraso)
+      delay=0    → sem delay de pipeline no driver
+    """
+    try:
+        import aiortc.codecs.h264 as _h264_mod
+
+        # Prova de fogo: abre e fecha um contexto NVENC real
+        _ctx = av.CodecContext.create("h264_nvenc", "w")
+        _ctx.width      = 128
+        _ctx.height     = 128
+        _ctx.pix_fmt    = "yuv420p"
+        _ctx.time_base  = fractions.Fraction(1, 90000)
+        _ctx.options    = {"preset": "p1", "tune": "ull", "rc": "cbr",
+                           "bf": "0", "delay": "0"}
+        _ctx.open()
+        _ctx.close()
+        del _ctx
+
+        def _nvenc_get_codec(frame: av.VideoFrame) -> av.CodecContext:
+            ctx = av.CodecContext.create("h264_nvenc", "w")
+            ctx.width     = frame.width
+            ctx.height    = frame.height
+            ctx.pix_fmt   = "yuv420p"
+            ctx.time_base = fractions.Fraction(1, 90000)
+            ctx.options   = {"preset": "p1", "tune": "ull", "rc": "cbr",
+                             "bf": "0", "delay": "0"}
+            ctx.open()
+            return ctx
+
+        cls = _h264_mod.H264Encoder
+        if not hasattr(cls, "_get_codec"):
+            log.warning("NVENC: H264Encoder._get_codec não encontrado — usando CPU")
+            return False
+
+        cls._get_codec = staticmethod(_nvenc_get_codec)
+        log.info("NVENC ativado: h264_nvenc preset=p1 tune=ull (latência ~1-3 ms)")
+        return True
+
+    except Exception as exc:
+        log.info(f"NVENC indisponível ({exc}) — usando libx264 (CPU)")
+        return False
+
+
 # ─── HTTP handlers ────────────────────────────────────────────────────────────
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -767,6 +819,8 @@ class MainWindow(QMainWindow):
 
     async def _async_server(self) -> None:
         self._stop_event = asyncio.Event()
+
+        _try_enable_nvenc()
 
         try:
             with mss.MSS() as sct:
