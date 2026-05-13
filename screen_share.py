@@ -414,9 +414,13 @@ def _patch_sdp_bitrate(sdp: str, kbps: int) -> str:
         if in_video and not video_b_injected and line.startswith("a="):
             out.append(f"b=AS:{kbps}")
             video_b_injected = True
-        # Opus: append low-latency params if not already present
+        # Opus: corrige parâmetros de packet loss e ptime
+        # minptime/maxptime=20 → jitter buffer calibrado para nossos pacotes de 20ms
+        # useinbandfec=1 → FEC embutido: pacote seguinte carrega cópia do perdido
+        # usedtx=0 → nunca pula pacotes no silêncio (evita falso positivo de perda)
+        # stereo=1 → habilita stereo no decoder do browser
         if in_audio and line.startswith("a=fmtp:") and "minptime" not in line:
-            out.append(line + ";minptime=10;useinbandfec=1;stereo=1")
+            out.append(line + ";minptime=20;maxptime=20;useinbandfec=1;usedtx=0;stereo=1")
             continue
         out.append(line)
     return "\r\n".join(out)
