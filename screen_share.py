@@ -72,28 +72,24 @@ def _grab_win32_cursor(left: int, top: int, width: int, height: int) -> np.ndarr
 class ScreenVideoTrack(VideoStreamTrack):
     """Captura contínua em thread dedicada — frame sempre pronto para WebRTC."""
 
-    _V_CLOCK   = 90000  # relógio de vídeo WebRTC padrão: 90 kHz
-    DELAY      = 0.060  # segundos de atraso do vídeo em relação ao áudio
-                        # 0.060 = 60ms = 3 chunks de áudio — imperceptível em screen share
-                        # aumente para 0.100 se ainda houver dessincronias ocasionais
+    _V_CLOCK = 90000  # relógio de vídeo WebRTC padrão: 90 kHz
 
     def __init__(self, monitor: int = 1, fps: int = 60, scale_width: int = 0):
         super().__init__()
-        self._monitor   = monitor
-        self._fps       = fps
-        self._scale_w   = scale_width
-        # deque de (cap_time, img) — tamanho = 2× o delay em frames
-        buf = max(12, int(fps * self.DELAY * 2) + 4)
-        self._buf: deque = deque(maxlen=buf)
+        self._monitor = monitor
+        self._fps     = fps
+        self._scale_w = scale_width
+        self._latest: np.ndarray | None = None
         self._lock      = threading.Lock()
-        self._has_frame = asyncio.Event()
+        self._new_frame = asyncio.Event()
         self._loop      = asyncio.get_running_loop()
-        self._v_epoch: float | None = None
+        self._v_ts:    int   = 0
+        self._v_start: float = 0.0
         threading.Thread(target=self._capture_loop, daemon=True).start()
 
     def _capture_loop(self) -> None:
         with mss.MSS() as sct:
-            mon      = sct.monitors[self._monitor]
+            mon     = sct.monitors[self._monitor]
             left, top, w, h = mon["left"], mon["top"], mon["width"], mon["height"]
             interval = 1.0 / (self._fps + 10)
             sw = self._scale_w
@@ -108,44 +104,32 @@ class ScreenVideoTrack(VideoStreamTrack):
                     sh  = int(h * sw / w) & ~1
                     tmp = av.VideoFrame.from_ndarray(img, format="bgra")
                     img = tmp.reformat(width=sw, height=sh).to_ndarray(format="bgra")
-                cap_time = time.monotonic()
                 with self._lock:
-                    self._buf.append((cap_time, img))
-                self._loop.call_soon_threadsafe(self._has_frame.set)
-                elapsed = cap_time - t0
+                    self._latest = img
+                self._loop.call_soon_threadsafe(self._new_frame.set)
+                elapsed = time.monotonic() - t0
                 if interval - elapsed > 0:
                     time.sleep(interval - elapsed)
 
     async def recv(self) -> av.VideoFrame:
-        while True:
-            cap_time = img = None
-            wait_s   = None
+        await self._new_frame.wait()
+        self._new_frame.clear()
+        with self._lock:
+            img = self._latest
 
-            with self._lock:
-                if self._buf:
-                    t, i = self._buf[0]
-                    age  = time.monotonic() - t
-                    if age >= self.DELAY:
-                        self._buf.popleft()
-                        cap_time, img = t, i
-                    else:
-                        wait_s = self.DELAY - age
+        # pacing idêntico ao next_timestamp() do aiortc, mas com fps configurado
+        # PTS é contador monotônico em ticks de 90 kHz — correto para RTCP SR
+        ptime = 1.0 / self._fps
+        if self._v_start == 0.0:
+            self._v_start = time.time()
+        else:
+            self._v_ts += int(ptime * self._V_CLOCK)
+            wait = self._v_start + (self._v_ts / self._V_CLOCK) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
 
-            if img is not None:
-                break
-            if wait_s is not None:
-                # frame existe mas ainda não tem idade suficiente — dorme o exato necessário
-                await asyncio.sleep(wait_s)
-            else:
-                # buffer vazio — aguarda a thread de captura
-                await self._has_frame.wait()
-                self._has_frame.clear()
-
-        if self._v_epoch is None:
-            self._v_epoch = cap_time
-        pts = int((cap_time - self._v_epoch) * self._V_CLOCK)
         frame = av.VideoFrame.from_ndarray(img, format="bgra")
-        frame.pts       = pts
+        frame.pts       = self._v_ts
         frame.time_base = fractions.Fraction(1, self._V_CLOCK)
         return frame
 
