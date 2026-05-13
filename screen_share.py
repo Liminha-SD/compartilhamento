@@ -403,17 +403,15 @@ _pcs: set[RTCPeerConnection] = set()
 # ─── NVENC GPU encoder ────────────────────────────────────────────────────────
 
 def _try_enable_nvenc() -> bool:
-    """Tenta substituir o encoder H264 do aiortc por h264_nvenc (GPU NVIDIA).
+    """Substitui o encoder H264 do aiortc por h264_nvenc (GPU NVIDIA).
 
-    Testa configurações da mais moderna para a mais básica:
-      p1/ull   → Ampere/Ada, ffmpeg 5+ (melhor latência)
-      ll/cbr   → Turing/Pascal, ffmpeg 4+ (boa latência)
-      fast     → qualquer NVENC, sem opções especiais (fallback)
+    Patcha H264Encoder._encode_frame para usar h264_nvenc ao invés de libx264.
+    Testa opções da mais moderna (Ampere p1/ull) para a mais básica (fallback).
+    Também remove o cap de 3 Mbps que o aiortc impõe no target_bitrate.
     """
-    # Candidatos: (opções, label)
     _CANDIDATES = [
         ({"preset": "p1", "tune": "ull", "rc": "cbr", "bf": "0", "delay": "0"},
-         "preset=p1 tune=ull rc=cbr"),
+         "preset=p1 tune=ull"),
         ({"preset": "p1", "rc": "cbr", "bf": "0", "delay": "0"},
          "preset=p1 rc=cbr"),
         ({"preset": "ll", "rc": "cbr_hq", "bf": "0", "zerolatency": "1"},
@@ -422,15 +420,10 @@ def _try_enable_nvenc() -> bool:
          "preset=ll"),
         ({"preset": "fast", "bf": "0"},
          "preset=fast"),
-        ({},
-         "defaults"),
+        ({}, "defaults"),
     ]
 
     import aiortc.codecs.h264 as _h264_mod
-
-    if not hasattr(_h264_mod.H264Encoder, "_get_codec"):
-        log.warning("NVENC: H264Encoder._get_codec não encontrado — usando CPU")
-        return False
 
     working_opts: dict | None = None
     working_label = ""
@@ -438,12 +431,11 @@ def _try_enable_nvenc() -> bool:
     for opts, label in _CANDIDATES:
         try:
             _ctx = av.CodecContext.create("h264_nvenc", "w")
-            _ctx.width     = 256
-            _ctx.height    = 256
-            _ctx.pix_fmt   = "yuv420p"
-            _ctx.time_base = fractions.Fraction(1, 90000)
-            _ctx.bit_rate  = 5_000_000
-            _ctx.options   = opts
+            _ctx.width    = 256
+            _ctx.height   = 256
+            _ctx.pix_fmt  = "yuv420p"
+            _ctx.bit_rate = 3_000_000
+            _ctx.options  = opts
             _ctx.open()
             _ctx.close()
             del _ctx
@@ -457,20 +449,44 @@ def _try_enable_nvenc() -> bool:
         log.info("NVENC indisponível — usando libx264 (CPU)")
         return False
 
-    _opts = working_opts  # captura para o closure
+    _opts = working_opts
 
-    def _nvenc_get_codec(frame: av.VideoFrame) -> av.CodecContext:
-        ctx = av.CodecContext.create("h264_nvenc", "w")
-        ctx.width     = frame.width
-        ctx.height    = frame.height
-        ctx.pix_fmt   = "yuv420p"
-        ctx.time_base = fractions.Fraction(1, 90000)
-        ctx.bit_rate  = _config.bitrate * 1000
-        ctx.options   = _opts
-        ctx.open()
-        return ctx
+    def _nvenc_encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
+        # Reinicia codec se resolução ou bitrate mudaram significativamente
+        if self.codec and (
+            frame.width  != self.codec.width
+            or frame.height != self.codec.height
+            or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate > 0.1
+        ):
+            self.buffer_data = b""
+            self.buffer_pts  = None
+            self.codec       = None
 
-    _h264_mod.H264Encoder._get_codec = staticmethod(_nvenc_get_codec)
+        if force_keyframe:
+            frame.pict_type = av.video.frame.PictureType.I
+        else:
+            frame.pict_type = av.video.frame.PictureType.NONE
+
+        if self.codec is None:
+            self.codec           = av.CodecContext.create("h264_nvenc", "w")
+            self.codec.width     = frame.width
+            self.codec.height    = frame.height
+            self.codec.bit_rate  = self.target_bitrate
+            self.codec.pix_fmt   = "yuv420p"
+            self.codec.options   = _opts
+
+        data_to_send = b""
+        for package in self.codec.encode(frame):
+            data_to_send += bytes(package)
+
+        if data_to_send:
+            yield from self._split_bitstream(data_to_send)
+
+    _h264_mod.H264Encoder._encode_frame = _nvenc_encode_frame
+
+    # Remove o cap de 3 Mbps do aiortc para permitir bitrates mais altos
+    _h264_mod.MAX_BITRATE = 50_000_000
+
     log.info(f"NVENC ativado: h264_nvenc {working_label} (latência ~1-3 ms)")
     return True
 
