@@ -398,6 +398,7 @@ class Config:
 
 _config = Config()
 _pcs: set[RTCPeerConnection] = set()
+_nvenc_enabled: bool | None = None  # None = ainda não testado
 
 
 # ─── NVENC GPU encoder ────────────────────────────────────────────────────────
@@ -409,6 +410,10 @@ def _try_enable_nvenc() -> bool:
     Testa opções da mais moderna (Ampere p1/ull) para a mais básica (fallback).
     Também remove o cap de 3 Mbps que o aiortc impõe no target_bitrate.
     """
+    global _nvenc_enabled
+    if _nvenc_enabled is not None:
+        return _nvenc_enabled
+
     _CANDIDATES = [
         ({"preset": "p1", "tune": "ull", "rc": "cbr", "bf": "0", "delay": "0"},
          "preset=p1 tune=ull"),
@@ -437,8 +442,7 @@ def _try_enable_nvenc() -> bool:
             _ctx.bit_rate = 3_000_000
             _ctx.options  = opts
             _ctx.open()
-            _ctx.close()
-            del _ctx
+            del _ctx  # PyAV não tem .close() em VideoCodecContext
             working_opts  = opts
             working_label = label
             break
@@ -447,6 +451,7 @@ def _try_enable_nvenc() -> bool:
 
     if working_opts is None:
         log.info("NVENC indisponível — usando libx264 (CPU)")
+        _nvenc_enabled = False
         return False
 
     _opts = working_opts
@@ -487,6 +492,7 @@ def _try_enable_nvenc() -> bool:
     # Remove o cap de 3 Mbps do aiortc para permitir bitrates mais altos
     _h264_mod.MAX_BITRATE = 50_000_000
 
+    _nvenc_enabled = True
     log.info(f"NVENC ativado: h264_nvenc {working_label} (latência ~1-3 ms)")
     return True
 
