@@ -405,51 +405,74 @@ _pcs: set[RTCPeerConnection] = set()
 def _try_enable_nvenc() -> bool:
     """Tenta substituir o encoder H264 do aiortc por h264_nvenc (GPU NVIDIA).
 
-    Opções de baixíssima latência:
-      preset=p1  → perfil mais rápido do NVENC Ampere
-      tune=ull   → ultra-low-latency (sem B-frames, buffer mínimo)
-      rc=cbr     → bitrate constante (estável na rede)
-      bf=0       → zero B-frames (cada frame é referência, sem atraso)
-      delay=0    → sem delay de pipeline no driver
+    Testa configurações da mais moderna para a mais básica:
+      p1/ull   → Ampere/Ada, ffmpeg 5+ (melhor latência)
+      ll/cbr   → Turing/Pascal, ffmpeg 4+ (boa latência)
+      fast     → qualquer NVENC, sem opções especiais (fallback)
     """
-    try:
-        import aiortc.codecs.h264 as _h264_mod
+    # Candidatos: (opções, label)
+    _CANDIDATES = [
+        ({"preset": "p1", "tune": "ull", "rc": "cbr", "bf": "0", "delay": "0"},
+         "preset=p1 tune=ull rc=cbr"),
+        ({"preset": "p1", "rc": "cbr", "bf": "0", "delay": "0"},
+         "preset=p1 rc=cbr"),
+        ({"preset": "ll", "rc": "cbr_hq", "bf": "0", "zerolatency": "1"},
+         "preset=ll rc=cbr_hq"),
+        ({"preset": "ll", "bf": "0"},
+         "preset=ll"),
+        ({"preset": "fast", "bf": "0"},
+         "preset=fast"),
+        ({},
+         "defaults"),
+    ]
 
-        # Prova de fogo: abre e fecha um contexto NVENC real
-        _ctx = av.CodecContext.create("h264_nvenc", "w")
-        _ctx.width      = 128
-        _ctx.height     = 128
-        _ctx.pix_fmt    = "yuv420p"
-        _ctx.time_base  = fractions.Fraction(1, 90000)
-        _ctx.options    = {"preset": "p1", "tune": "ull", "rc": "cbr",
-                           "bf": "0", "delay": "0"}
-        _ctx.open()
-        _ctx.close()
-        del _ctx
+    import aiortc.codecs.h264 as _h264_mod
 
-        def _nvenc_get_codec(frame: av.VideoFrame) -> av.CodecContext:
-            ctx = av.CodecContext.create("h264_nvenc", "w")
-            ctx.width     = frame.width
-            ctx.height    = frame.height
-            ctx.pix_fmt   = "yuv420p"
-            ctx.time_base = fractions.Fraction(1, 90000)
-            ctx.options   = {"preset": "p1", "tune": "ull", "rc": "cbr",
-                             "bf": "0", "delay": "0"}
-            ctx.open()
-            return ctx
-
-        cls = _h264_mod.H264Encoder
-        if not hasattr(cls, "_get_codec"):
-            log.warning("NVENC: H264Encoder._get_codec não encontrado — usando CPU")
-            return False
-
-        cls._get_codec = staticmethod(_nvenc_get_codec)
-        log.info("NVENC ativado: h264_nvenc preset=p1 tune=ull (latência ~1-3 ms)")
-        return True
-
-    except Exception as exc:
-        log.info(f"NVENC indisponível ({exc}) — usando libx264 (CPU)")
+    if not hasattr(_h264_mod.H264Encoder, "_get_codec"):
+        log.warning("NVENC: H264Encoder._get_codec não encontrado — usando CPU")
         return False
+
+    working_opts: dict | None = None
+    working_label = ""
+
+    for opts, label in _CANDIDATES:
+        try:
+            _ctx = av.CodecContext.create("h264_nvenc", "w")
+            _ctx.width     = 256
+            _ctx.height    = 256
+            _ctx.pix_fmt   = "yuv420p"
+            _ctx.time_base = fractions.Fraction(1, 90000)
+            _ctx.bit_rate  = 5_000_000
+            _ctx.options   = opts
+            _ctx.open()
+            _ctx.close()
+            del _ctx
+            working_opts  = opts
+            working_label = label
+            break
+        except Exception:
+            continue
+
+    if working_opts is None:
+        log.info("NVENC indisponível — usando libx264 (CPU)")
+        return False
+
+    _opts = working_opts  # captura para o closure
+
+    def _nvenc_get_codec(frame: av.VideoFrame) -> av.CodecContext:
+        ctx = av.CodecContext.create("h264_nvenc", "w")
+        ctx.width     = frame.width
+        ctx.height    = frame.height
+        ctx.pix_fmt   = "yuv420p"
+        ctx.time_base = fractions.Fraction(1, 90000)
+        ctx.bit_rate  = _config.bitrate * 1000
+        ctx.options   = _opts
+        ctx.open()
+        return ctx
+
+    _h264_mod.H264Encoder._get_codec = staticmethod(_nvenc_get_codec)
+    log.info(f"NVENC ativado: h264_nvenc {working_label} (latência ~1-3 ms)")
+    return True
 
 
 # ─── HTTP handlers ────────────────────────────────────────────────────────────
