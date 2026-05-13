@@ -15,7 +15,6 @@ import queue as _queue
 import socket
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 
 if sys.platform == "win32":
@@ -112,21 +111,21 @@ class ScreenVideoTrack(VideoStreamTrack):
                     time.sleep(interval - elapsed)
 
     async def recv(self) -> av.VideoFrame:
-        await self._new_frame.wait()
-        self._new_frame.clear()
-        with self._lock:
-            img = self._latest
-
-        # pacing idêntico ao next_timestamp() do aiortc, mas com fps configurado
-        # PTS é contador monotônico em ticks de 90 kHz — correto para RTCP SR
         ptime = 1.0 / self._fps
         if self._v_start == 0.0:
+            # primeiro frame: espera ao menos um frame capturado
+            await self._new_frame.wait()
+            self._new_frame.clear()
             self._v_start = time.time()
         else:
+            # pacing primeiro — depois pega o frame mais recente disponível
             self._v_ts += int(ptime * self._V_CLOCK)
             wait = self._v_start + (self._v_ts / self._V_CLOCK) - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
+
+        with self._lock:
+            img = self._latest
 
         frame = av.VideoFrame.from_ndarray(img, format="bgra")
         frame.pts       = self._v_ts
@@ -171,15 +170,15 @@ if AUDIO_OK:
 
         def __init__(self, device_name: str = ""):
             super().__init__()
-            self._device_name  = device_name
-            self._sample_rate  = 48000
-            self._time_base    = fractions.Fraction(1, 48000)
-            self._pts          = 0
-            self._latest_pcm: np.ndarray | None = None
-            self._pcm_lock     = threading.Lock()
-            self._new_chunk    = asyncio.Event()
-            self._loop         = asyncio.get_running_loop()
-            self._stop         = threading.Event()
+            self._device_name = device_name
+            self._sample_rate = 48000
+            self._time_base   = fractions.Fraction(1, 48000)
+            self._pts         = 0
+            # fila com 3 slots (~60ms) — absorve jitter do encoding H264
+            # drop-oldest: descarta o mais antigo quando cheia, nunca o mais novo
+            self._queue: asyncio.Queue = asyncio.Queue(maxsize=3)
+            self._loop  = asyncio.get_running_loop()
+            self._stop  = threading.Event()
             threading.Thread(target=self._capture, daemon=True).start()
 
         def stop(self):
@@ -241,11 +240,23 @@ if AUDIO_OK:
             return stream, dev["name"], native_ch, chunk
 
         def _capture(self) -> None:
+            def _put_fresh(packed):
+                # drop-oldest: descarta o mais antigo quando cheia, mantém o mais novo
+                if self._queue.full():
+                    try: self._queue.get_nowait()
+                    except asyncio.QueueEmpty: pass
+                try: self._queue.put_nowait(packed)
+                except asyncio.QueueFull: pass
+
             while not self._stop.is_set():
                 pa = stream = None
                 try:
                     pa = _pawp.PyAudio()
                     stream, dev_name, ch, chunk = self._open(pa)
+                    # descarta chunks acumulados antes do peer conectar
+                    while not self._queue.empty():
+                        try: self._queue.get_nowait()
+                        except Exception: break
                     log.info(f"Áudio WASAPI: {dev_name} @ 48000Hz {ch}ch")
 
                     while not self._stop.is_set():
@@ -259,9 +270,7 @@ if AUDIO_OK:
                             stereo = data[:, :2]
                         pcm    = (np.clip(stereo, -1.0, 1.0) * 32767).astype(np.int16)
                         packed = pcm.flatten().reshape(1, -1).copy()
-                        with self._pcm_lock:
-                            self._latest_pcm = packed
-                        self._loop.call_soon_threadsafe(self._new_chunk.set)
+                        self._loop.call_soon_threadsafe(_put_fresh, packed)
 
                 except Exception as exc:
                     if not self._stop.is_set():
@@ -276,11 +285,9 @@ if AUDIO_OK:
                         except Exception: pass
 
         async def recv(self) -> av.AudioFrame:
-            await self._new_chunk.wait()
-            self._new_chunk.clear()
-            with self._pcm_lock:
-                packed = self._latest_pcm
-            if packed is None:
+            try:
+                packed = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
                 packed = np.zeros((1, self.CHUNK * 2), dtype=np.int16)
 
             frame = av.AudioFrame.from_ndarray(packed, format="s16", layout="stereo")
@@ -458,10 +465,10 @@ async def handle_offer(request: web.Request) -> web.Response:
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QPlainTextEdit,
-    QFrame, QScrollArea, QSplitter, QSizePolicy,
+    QFrame, QScrollArea, QSplitter,
 )
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor
+from PySide6.QtGui import QFont, QTextCursor
 
 DARK_STYLE = """
 QWidget { background:#1a1a1a; color:#e0e0e0; font-size:13px; }
